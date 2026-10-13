@@ -13,6 +13,7 @@ mod db;
 mod handlers;
 mod middleware;
 mod models;
+mod safe_path;
 mod services;
 mod session;
 mod utils;
