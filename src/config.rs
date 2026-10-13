@@ -9,6 +9,9 @@ pub struct AppConfig {
     pub port: u16,
     pub jwt_secret: String,
     pub cookie_secret: String,
+    /// HMAC key for session cookies (`SECRET_KEY`). Required outside development/test.
+    #[serde(default)]
+    pub secret_key: Option<String>,
 
     #[serde(default = "default_storage_backend")]
     pub storage_backend: String,

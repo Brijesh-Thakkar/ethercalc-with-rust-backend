@@ -57,6 +57,8 @@ PORT=8080
 
 COOKIE_SECRET=your-cookie-secret-key-here
 JWT_SECRET=your-jwt-secret-key-here
+# Signs session cookies; at least 32 bytes. Required unless ENVIRONMENT is development/test.
+SECRET_KEY=generate-with-openssl-rand-base64-48
 
 STORAGE_BACKEND=minio
 

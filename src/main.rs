@@ -15,17 +15,20 @@ mod middleware;
 mod models;
 mod services;
 mod session;
+mod session_token;
 mod utils;
 
 use config::AppConfig;
 use db::Database;
 use session::SessionManager;
+use session_token::SessionSigner;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub config: AppConfig,
     pub session_manager: SessionManager,
+    pub session: SessionSigner,
 }
 
 #[tokio::main]
@@ -35,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load().expect("Failed to load configuration");
     let db = Database::new(&config.mongo_uri, &config.mongo_database, &config.mysql_dsn).await?;
     let session_manager = SessionManager::new();
+    let session = SessionSigner::from_config(&config.environment, config.secret_key.as_deref())?;
 
     let port = config.port;
     let static_path = config.static_path.clone();
@@ -42,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         config,
         session_manager,
+        session,
     };
 
     let api_routes = Router::new()
@@ -82,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
             "/browser/static/*filepath",
             get(handlers::app::handle_google_verification),
         )
-        .layer(axum::middleware::from_fn(middleware::auth_guard))
+        .layer(axum::middleware::from_fn_with_state(
+            state.session.clone(),
+            middleware::auth_guard,
+        ))
         .with_state(state.clone());
 
     let app = Router::new()

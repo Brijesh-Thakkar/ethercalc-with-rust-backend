@@ -17,12 +17,13 @@ pub mod save;
 pub mod user_sheet;
 pub mod webapp;
 
+use crate::session_token::{unix_now, SessionClaims, SessionSigner, SESSION_COOKIE};
 use crate::AppState;
 use axum::{
     extract::State,
     response::{Html, IntoResponse, Json, Redirect},
 };
-use axum_extra::extract::cookie::CookieJar;
+use axum_extra::extract::cookie::{Cookie, CookieJar};
 use serde_json::json;
 
 pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -34,8 +35,8 @@ pub async fn health_check(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
-pub async fn home(jar: CookieJar) -> Result<Redirect, Redirect> {
-    if get_current_user_id(&jar).is_some() {
+pub async fn home(State(state): State<AppState>, jar: CookieJar) -> Result<Redirect, Redirect> {
+    if get_current_user_id(&jar, &state.session).is_some() {
         return Ok(Redirect::to("/dashboard"));
     }
     Ok(Redirect::to("/login"))
@@ -57,51 +58,35 @@ pub async fn test_page() -> impl IntoResponse {
     Html(html)
 }
 
-pub fn get_current_user(jar: &CookieJar) -> Option<String> {
-    jar.get("user").and_then(|cookie| {
-        let value = cookie.value();
-        if value.starts_with('"') && value.ends_with('"') {
-            serde_json::from_str::<String>(value).ok()
-        } else {
-            Some(value.to_string())
-        }
-    })
+pub fn current_session(jar: &CookieJar, signer: &SessionSigner) -> Option<SessionClaims> {
+    let cookie = jar.get(SESSION_COOKIE)?;
+    signer.verify(cookie.value(), unix_now())
 }
 
-pub fn get_current_user_id(jar: &CookieJar) -> Option<uuid::Uuid> {
-    jar.get("user_id")
-        .and_then(|c| uuid::Uuid::parse_str(c.value()).ok())
+pub fn get_current_user(jar: &CookieJar, signer: &SessionSigner) -> Option<String> {
+    current_session(jar, signer).map(|c| c.email)
 }
 
-/// Sets both "user" (email) and "user_id" (uuid) cookies so auth_guard can add Extension<Uuid>.
+pub fn get_current_user_id(jar: &CookieJar, signer: &SessionSigner) -> Option<uuid::Uuid> {
+    current_session(jar, signer).map(|c| c.user_id)
+}
+
+/// Issues the signed session cookie for a freshly authenticated user.
 pub fn create_user_cookie(
+    signer: &SessionSigner,
     email: &str,
     user_id: uuid::Uuid,
-) -> [axum_extra::extract::cookie::Cookie<'static>; 2] {
-    let user_json = serde_json::to_string(email).unwrap_or_else(|_| format!("\"{}\"", email));
-    let user = axum_extra::extract::cookie::Cookie::build(("user", user_json))
-        .path("/")
-        .http_only(true)
-        .max_age(time::Duration::days(30))
-        .build();
-    let user_id_cookie = axum_extra::extract::cookie::Cookie::build(("user_id", user_id.to_string()))
-        .path("/")
-        .http_only(true)
-        .max_age(time::Duration::days(30))
-        .build();
-    [user, user_id_cookie]
+) -> Cookie<'static> {
+    signer.cookie(user_id, email, unix_now())
 }
 
-pub fn clear_user_cookie() -> [axum_extra::extract::cookie::Cookie<'static>; 2] {
-    let user = axum_extra::extract::cookie::Cookie::build(("user", ""))
-        .path("/")
-        .http_only(true)
-        .max_age(time::Duration::seconds(0))
-        .build();
-    let user_id = axum_extra::extract::cookie::Cookie::build(("user_id", ""))
-        .path("/")
-        .http_only(true)
-        .max_age(time::Duration::seconds(0))
-        .build();
-    [user, user_id]
+/// Expires the session cookie, plus the unsigned cookies used by earlier versions.
+pub fn clear_user_cookie() -> [Cookie<'static>; 3] {
+    [SESSION_COOKIE, "user", "user_id"].map(|name| {
+        Cookie::build((name, ""))
+            .path("/")
+            .http_only(true)
+            .max_age(time::Duration::seconds(0))
+            .build()
+    })
 }

@@ -236,8 +236,7 @@ async fn handle_login_internal(
         }
     }
 
-    let [c1, c2] = create_user_cookie(&email, user.id);
-    let jar = jar.add(c1).add(c2);
+    let jar = jar.add(create_user_cookie(&state.session, &email, user.id));
 
     if is_json {
         Ok((
@@ -319,8 +318,7 @@ async fn handle_register_internal(
             // TODO: Create user directories in storage
             // This would be implemented based on the storage backend
 
-            let [c1, c2] = create_user_cookie(&email, user.id);
-            let jar = jar.add(c1).add(c2);
+            let jar = jar.add(create_user_cookie(&state.session, &email, user.id));
 
             if is_json {
                 Ok((
@@ -346,8 +344,8 @@ async fn handle_register_internal(
 fn handle_logout_internal(jar: CookieJar, is_json: bool) -> Response {
     tracing::info!("Logging out user");
 
-    let [c1, c2] = clear_user_cookie();
-    let jar = jar.add(c1).add(c2).remove(Cookie::from("session"));
+    let [c1, c2, c3] = clear_user_cookie();
+    let jar = jar.add(c1).add(c2).add(c3).remove(Cookie::from("session"));
 
     if is_json {
         (
@@ -484,8 +482,7 @@ pub async fn api_login(
         ));
     }
 
-    let [c1, c2] = create_user_cookie(&payload.email, user.id);
-    let jar = jar.add(c1).add(c2);
+    let jar = jar.add(create_user_cookie(&state.session, &payload.email, user.id));
 
     Ok((
         jar,
@@ -555,8 +552,7 @@ pub async fn api_register(
         Ok(user) => {
             tracing::info!("User created successfully: {}", payload.email);
 
-            let [c1, c2] = create_user_cookie(&payload.email, user.id);
-            let jar = jar.add(c1).add(c2);
+            let jar = jar.add(create_user_cookie(&state.session, &payload.email, user.id));
 
             Ok((
                 jar,
@@ -579,8 +575,8 @@ pub async fn api_register(
 }
 
 pub async fn api_logout(jar: CookieJar) -> (CookieJar, Json<serde_json::Value>) {
-    let [c1, c2] = clear_user_cookie();
-    let jar = jar.add(c1).add(c2).remove(Cookie::from("session"));
+    let [c1, c2, c3] = clear_user_cookie();
+    let jar = jar.add(c1).add(c2).add(c3).remove(Cookie::from("session"));
 
     (
         jar,
@@ -594,7 +590,7 @@ pub async fn api_me(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Some(user_email) = get_current_user(&jar) {
+    if let Some(user_email) = get_current_user(&jar, &state.session) {
         if let Ok(Some(user)) = state.db.get_user_by_email(&user_email).await {
             return Ok(Json(json!({
                 "email": user.email,

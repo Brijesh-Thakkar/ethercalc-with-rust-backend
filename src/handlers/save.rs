@@ -40,8 +40,8 @@ pub async fn handle_save<B>(
     }
 }
 
-pub async fn handle_save_get(State(_state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    let user = match get_current_user(&jar) {
+pub async fn handle_save_get(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    let user = match get_current_user(&jar, &state.session) {
         Some(u) => u,
         None => return Redirect::to("/login").into_response(),
     };
@@ -81,11 +81,11 @@ pub async fn handle_save_get(State(_state): State<AppState>, jar: CookieJar) -> 
 }
 
 pub async fn handle_save_post(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     jar: CookieJar,
     Form(form): Form<SaveForm>,
 ) -> impl IntoResponse {
-    let user = match get_current_user(&jar) {
+    let user = match get_current_user(&jar, &state.session) {
         Some(u) => u,
         None => {
             return Json(json!({

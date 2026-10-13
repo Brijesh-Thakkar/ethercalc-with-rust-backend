@@ -17,7 +17,7 @@ pub struct DropboxQuery {
 
 // Handle landing page
 pub async fn handle_landing(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    let user = get_current_user(&jar);
+    let user = get_current_user(&jar, &state.session);
 
     tracing::info!("Landing page - current user: {:?}", user);
 
@@ -68,7 +68,7 @@ pub async fn handle_amazon_webapp(
     jar: CookieJar,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Check if user is logged in
-    let user = get_current_user(&jar);
+    let user = get_current_user(&jar, &state.session);
     if user.is_none() {
         return Ok(Redirect::to("/browser").into_response());
     }
