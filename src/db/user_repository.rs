@@ -79,6 +79,27 @@ impl<'a> UserRepository<'a> {
         Ok(())
     }
 
+    pub async fn reset_password_with_dongle(
+        &self,
+        user_id: Uuid,
+        expected_dongle: &str,
+        password_hash: &str,
+    ) -> Result<bool> {
+        let pool = self.get_pool()?;
+
+        let result = sqlx::query(
+            "UPDATE users SET password_hash = ?, dongle = NULL, updated_at = ? WHERE id = ? AND dongle = ?",
+        )
+        .bind(password_hash)
+        .bind(Utc::now())
+        .bind(user_id.to_string())
+        .bind(expected_dongle)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn set_dongle(&self, user_id: Uuid, dongle: &str) -> Result<()> {
         let pool = self.get_pool()?;
 

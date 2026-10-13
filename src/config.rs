@@ -9,6 +9,9 @@ pub struct AppConfig {
     pub port: u16,
     pub jwt_secret: String,
     pub cookie_secret: String,
+    /// Public base URL used in emailed links (`PUBLIC_BASE_URL`).
+    #[serde(default)]
+    pub public_base_url: Option<String>,
 
     #[serde(default = "default_storage_backend")]
     pub storage_backend: String,

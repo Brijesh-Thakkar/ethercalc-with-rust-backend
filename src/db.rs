@@ -134,6 +134,19 @@ impl Database {
         self.users().update_password(user_id, password_hash).await
     }
 
+    /// Sets the new password and clears the reset token, only if the stored
+    /// token still equals `expected_dongle`. Returns whether it was consumed.
+    pub async fn reset_user_password_with_dongle(
+        &self,
+        user_id: Uuid,
+        expected_dongle: &str,
+        password_hash: &str,
+    ) -> Result<bool> {
+        self.users()
+            .reset_password_with_dongle(user_id, expected_dongle, password_hash)
+            .await
+    }
+
     pub async fn set_user_dongle(&self, user_id: Uuid, dongle: &str) -> Result<()> {
         self.users().set_dongle(user_id, dongle).await
     }

@@ -5,14 +5,15 @@ use axum::{
     Form,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
-use base64::{engine::general_purpose, Engine as _};
-use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     auth::{hash_password, verify_password},
+    db::Database,
     handlers::{clear_user_cookie, create_user_cookie, get_current_user},
+    reset_token,
+    services::email::EmailService,
     AppState,
 };
 
@@ -48,6 +49,8 @@ pub struct PasswordResetQuery {
 pub struct PasswordResetRequest {
     email: String,
     password: String,
+    #[serde(default)]
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,14 +114,25 @@ pub async fn password_reset_page(Query(query): Query<PasswordResetQuery>) -> imp
 <body><h1>Reset Your Password</h1>
 <form method="post">
 <input type="hidden" name="email" value="{{ reguser }}" />
+<input type="hidden" name="token" value="{{ token }}" />
 <input type="password" name="password" placeholder="New Password" required />
 <button type="submit">Reset Password</button>
 </form></body></html>"#
             .to_string()
     });
 
-    let html = html.replace("{{ reguser }}", &query.u);
+    let html = html
+        .replace("{{ reguser }}", &html_escape(&query.u))
+        .replace("{{ token }}", &html_escape(&query.d));
     Html(html)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 // Handle /iauth endpoint
@@ -370,13 +384,13 @@ pub async fn lost_password(
     // Check if user exists
     match state.db.get_user_by_email(&form.email).await {
         Ok(Some(user)) => {
-            // Generate dongle
-            let dongle = generate_random_string(20);
+            let (token, stored) = reset_token::generate(reset_token::now());
+            if let Err(e) = state.db.set_user_dongle(user.id, &stored).await {
+                tracing::error!("Failed to store reset token: {:?}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
 
-            // Save dongle to user
-            let _ = state.db.set_user_dongle(user.id, &dongle).await;
-
-            // In real implementation, send email here
+            send_reset_email(&state, &form.email, &token).await;
             tracing::info!("Password reset requested for: {}", form.email);
 
             let html = std::fs::read_to_string("web/templates/lostpassword-sentemail.html")
@@ -394,44 +408,107 @@ pub async fn lost_password(
     }
 }
 
-pub async fn password_reset(
-    State(state): State<AppState>,
-    Form(form): Form<PasswordResetRequest>,
-) -> Result<Html<String>, StatusCode> {
-    // Check if user exists
-    match state.db.get_user_by_email(&form.email).await {
-        Ok(Some(user)) => {
-            // Hash new password
-            let password_hash = match hash_password(&form.password) {
-                Ok(hash) => hash,
-                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-            };
+async fn send_reset_email(state: &AppState, email: &str, token: &str) {
+    let base = state
+        .config
+        .public_base_url
+        .clone()
+        .unwrap_or_else(|| format!("http://localhost:{}", state.config.port));
+    let link = match reqwest::Url::parse(&format!("{}/pwreset", base.trim_end_matches('/'))) {
+        Ok(mut url) => {
+            url.query_pairs_mut()
+                .append_pair("u", email)
+                .append_pair("d", token);
+            url.to_string()
+        }
+        Err(e) => {
+            tracing::error!("Invalid PUBLIC_BASE_URL: {:?}", e);
+            return;
+        }
+    };
 
-            // Update password
-            match state.db.update_user_password(user.id, &password_hash).await {
-                Ok(_) => {
-                    let html = std::fs::read_to_string("web/templates/pwreset-ok.html")
-                        .unwrap_or_else(|_| "<h1>Password reset successful</h1>".to_string());
-                    let html = html.replace("{{ reguser }}", &form.email);
-                    Ok(Html(html))
-                }
-                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-            }
-        }
-        Ok(None) => {
-            let html = std::fs::read_to_string("web/templates/pwreset-invalid.html")
-                .unwrap_or_else(|_| "<h1>Invalid reset link</h1>".to_string());
-            let html = html.replace("{{ reguser }}", &form.email);
-            Ok(Html(html))
-        }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    if state.config.environment == "development" {
+        tracing::info!("Password reset link (development only): {}", link);
+    }
+
+    let body = format!(
+        "<p>Use the link below to choose a new password. It can be used once and expires in one hour.</p><p><a href=\"{}\">Reset password</a></p>",
+        html_escape(&link)
+    );
+    let service = EmailService::new(&state.config).await;
+    if let Err(e) = service
+        .send_html_email(email, "Reset your password", &body)
+        .await
+    {
+        tracing::error!("Failed to send password reset email: {:?}", e);
     }
 }
 
-fn generate_random_string(length: usize) -> String {
-    let mut rng = rand::rng();
-    let bytes: Vec<u8> = (0..length).map(|_| rng.random()).collect();
-    general_purpose::URL_SAFE_NO_PAD.encode(&bytes)[..length].to_string()
+pub async fn password_reset(
+    State(state): State<AppState>,
+    Form(form): Form<PasswordResetRequest>,
+) -> Result<Response, StatusCode> {
+    match reset_password_with_token(
+        &state.db,
+        &form.email,
+        &form.token,
+        &form.password,
+        reset_token::now(),
+    )
+    .await
+    {
+        Ok(ResetOutcome::Reset) => {
+            let html = std::fs::read_to_string("web/templates/pwreset-ok.html")
+                .unwrap_or_else(|_| "<h1>Password reset successful</h1>".to_string());
+            let html = html.replace("{{ reguser }}", &html_escape(&form.email));
+            Ok(Html(html).into_response())
+        }
+        Ok(ResetOutcome::Invalid) => {
+            let html = std::fs::read_to_string("web/templates/pwreset-invalid.html")
+                .unwrap_or_else(|_| "<h1>Invalid or expired reset link</h1>".to_string());
+            let html = html.replace("{{ reguser }}", &html_escape(&form.email));
+            Ok((StatusCode::BAD_REQUEST, Html(html)).into_response())
+        }
+        Err(e) => {
+            tracing::error!("Password reset error: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResetOutcome {
+    Reset,
+    Invalid,
+}
+
+/// Changes the password only if `token` is the valid, unexpired, unused reset
+/// token issued to this user. The token is consumed atomically.
+pub async fn reset_password_with_token(
+    db: &Database,
+    email: &str,
+    token: &str,
+    new_password: &str,
+    now: i64,
+) -> anyhow::Result<ResetOutcome> {
+    let Some(user) = db.get_user_by_email(email).await? else {
+        return Ok(ResetOutcome::Invalid);
+    };
+    let Some(stored) = user.dongle.as_deref() else {
+        return Ok(ResetOutcome::Invalid);
+    };
+    if new_password.is_empty() || !reset_token::matches(stored, token, now) {
+        return Ok(ResetOutcome::Invalid);
+    }
+    let password_hash = hash_password(new_password)?;
+    if db
+        .reset_user_password_with_dongle(user.id, stored, &password_hash)
+        .await?
+    {
+        Ok(ResetOutcome::Reset)
+    } else {
+        Ok(ResetOutcome::Invalid)
+    }
 }
 
 // API endpoints for JSON responses
@@ -604,4 +681,118 @@ pub async fn api_me(
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+#[cfg(test)]
+mod tests {
+    //! These need disposable databases, so they are ignored by default:
+    //! `TEST_MYSQL_DSN=mysql://root:pw@127.0.0.1:3306/db cargo test -- --ignored`
+
+    use super::*;
+    use crate::auth::verify_password;
+    use uuid::Uuid;
+
+    const OLD_PW: &str = "old-password-1";
+    const NEW_PW: &str = "new-password-2";
+
+    async fn test_db() -> Database {
+        let mongo = std::env::var("TEST_MONGO_URI")
+            .unwrap_or_else(|_| "mongodb://127.0.0.1:27117".to_string());
+        let mysql = std::env::var("TEST_MYSQL_DSN")
+            .unwrap_or_else(|_| "mysql://root:throwaway@127.0.0.1:33317/touchcalc_test".into());
+        Database::new(&mongo, "tc_unit_tests", &mysql)
+            .await
+            .unwrap()
+    }
+
+    async fn new_user(db: &Database) -> String {
+        let email = format!("{}@example.test", Uuid::new_v4());
+        db.create_user(&email, &hash_password(OLD_PW).unwrap())
+            .await
+            .unwrap();
+        email
+    }
+
+    async fn issue(db: &Database, email: &str, issued_at: i64) -> String {
+        let user = db.get_user_by_email(email).await.unwrap().unwrap();
+        let (token, stored) = reset_token::generate(issued_at);
+        db.set_user_dongle(user.id, &stored).await.unwrap();
+        token
+    }
+
+    async fn password_is(db: &Database, email: &str, pw: &str) -> bool {
+        let user = db.get_user_by_email(email).await.unwrap().unwrap();
+        verify_password(pw, &user.password_hash).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL"]
+    async fn reset_without_a_token_does_not_change_the_password() {
+        let db = test_db().await;
+        let email = new_user(&db).await;
+        let now = reset_token::now();
+
+        let out = reset_password_with_token(&db, &email, "", NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+
+        issue(&db, &email, now).await;
+        let out = reset_password_with_token(&db, &email, "", NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+        let out = reset_password_with_token(&db, &email, "guess", NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+        assert!(password_is(&db, &email, OLD_PW).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL"]
+    async fn valid_token_resets_once_only() {
+        let db = test_db().await;
+        let email = new_user(&db).await;
+        let now = reset_token::now();
+        let token = issue(&db, &email, now).await;
+
+        let out = reset_password_with_token(&db, &email, &token, NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Reset);
+        assert!(password_is(&db, &email, NEW_PW).await);
+        assert!(!password_is(&db, &email, OLD_PW).await);
+
+        let out = reset_password_with_token(&db, &email, &token, "third-pw-3", now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+        assert!(password_is(&db, &email, NEW_PW).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL"]
+    async fn expired_token_is_rejected() {
+        let db = test_db().await;
+        let email = new_user(&db).await;
+        let now = reset_token::now();
+        let token = issue(&db, &email, now - reset_token::RESET_TOKEN_TTL_SECS - 1).await;
+
+        let out = reset_password_with_token(&db, &email, &token, NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+        assert!(password_is(&db, &email, OLD_PW).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL"]
+    async fn token_is_tied_to_the_user_it_was_issued_to() {
+        let db = test_db().await;
+        let (alice, bob) = (new_user(&db).await, new_user(&db).await);
+        let now = reset_token::now();
+        let alice_token = issue(&db, &alice, now).await;
+        issue(&db, &bob, now).await;
+
+        let out = reset_password_with_token(&db, &bob, &alice_token, NEW_PW, now).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+        assert!(password_is(&db, &bob, OLD_PW).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL"]
+    async fn unknown_user_is_rejected() {
+        let db = test_db().await;
+        let out = reset_password_with_token(&db, "nobody@example.test", "t", NEW_PW, 0).await;
+        assert_eq!(out.unwrap(), ResetOutcome::Invalid);
+    }
 }
